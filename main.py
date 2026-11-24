@@ -127,4 +127,16 @@ def profile(authorization: str | None = Header(None)):
     scheme, _, token = (authorization or "").partition(" ")
     if scheme.lower() != "bearer" or not token.strip():
         return error(401, "Access token required")
-    return {"message": "Token received (not verified yet)"}
+    try:
+        response = supabase_client().auth.get_user(token.strip())
+    except AuthApiError:
+        response = None
+    if response is None or response.user is None:
+        return error(401, "Invalid or expired token")
+    user = response.user
+    return {
+        "id": user.id,
+        "email": user.email,
+        "created_at": user.created_at.isoformat() if user.created_at else None,
+        "last_sign_in_at": user.last_sign_in_at.isoformat() if user.last_sign_in_at else None,
+    }
