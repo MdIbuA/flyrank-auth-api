@@ -8,7 +8,7 @@ import logging
 from contextlib import asynccontextmanager
 
 import httpx
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, Header, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, StrictStr, field_validator
@@ -115,3 +115,16 @@ def login(body: Credentials):
         "expires_in": session.expires_in,
         "user": {"id": result.user.id, "email": result.user.email},
     }
+
+
+@app.get("/public/info", tags=["public"], summary="Anyone can read this")
+def public_info():
+    return {"message": "Welcome stranger! This info is public."}
+
+
+@app.get("/protected/profile", tags=["protected"], summary="Your account details")
+def profile(authorization: str | None = Header(None)):
+    scheme, _, token = (authorization or "").partition(" ")
+    if scheme.lower() != "bearer" or not token.strip():
+        return error(401, "Access token required")
+    return {"message": "Token received (not verified yet)"}
