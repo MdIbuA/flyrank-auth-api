@@ -1,6 +1,7 @@
 """Supabase client factory and the reusable "is this request logged in?" guard."""
 
-from fastapi import Depends, Header
+from fastapi import Depends
+from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from supabase import Client, ClientOptions, create_client
 from supabase_auth.errors import AuthError
 
@@ -28,12 +29,15 @@ def supabase_client() -> Client:
     )
 
 
-def bearer_token(authorization: str | None = Header(None)) -> str:
+# auto_error=False: we write our own 401 messages instead of FastAPI's 403.
+bearer_scheme = HTTPBearer(auto_error=False, description="Paste the access_token from POST /auth/login")
+
+
+def bearer_token(credentials: HTTPAuthorizationCredentials | None = Depends(bearer_scheme)) -> str:
     """Pull the token out of `Authorization: Bearer <token>` or fail with 401."""
-    scheme, _, token = (authorization or "").partition(" ")
-    if scheme.lower() != "bearer" or not token.strip():
+    if credentials is None or credentials.scheme.lower() != "bearer" or not credentials.credentials.strip():
         raise AuthFailure("Access token required")
-    return token.strip()
+    return credentials.credentials.strip()
 
 
 def require_user(token: str = Depends(bearer_token)) -> dict:
