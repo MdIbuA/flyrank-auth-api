@@ -8,9 +8,14 @@ import logging
 from contextlib import asynccontextmanager
 
 import httpx
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
+from fastapi.exceptions import RequestValidationError
+from fastapi.responses import JSONResponse
+from pydantic import BaseModel, StrictStr, field_validator
+from supabase_auth.errors import AuthApiError
 
 import config
+from auth import supabase_client
 
 log = logging.getLogger("uvicorn.error")
 
@@ -35,3 +40,78 @@ app = FastAPI(
     description="Sign up and log in through Supabase Auth, then call protected routes with the JWT.",
     lifespan=lifespan,
 )
+
+
+# ---------- Schemas ----------
+
+class Credentials(BaseModel):
+    email: StrictStr
+    password: StrictStr
+
+    model_config = {"json_schema_extra": {"examples": [{"email": "test@example.com", "password": "password123"}]}}
+
+    @field_validator("email", "password")
+    @classmethod
+    def not_blank(cls, value: str, info) -> str:
+        if not value.strip():
+            raise ValueError(f"{info.field_name} must not be empty")
+        return value.strip() if info.field_name == "email" else value
+
+
+class ErrorMessage(BaseModel):
+    error: str
+
+
+BAD_REQUEST = {400: {"model": ErrorMessage, "description": "Missing or invalid email/password"}}
+
+
+# ---------- Errors ----------
+
+def error(status: int, message: str) -> JSONResponse:
+    return JSONResponse(status_code=status, content={"error": message})
+
+
+@app.exception_handler(RequestValidationError)
+async def validation_error_handler(request: Request, exc: RequestValidationError):
+    first = exc.errors()[0]
+    field = ".".join(str(part) for part in first["loc"] if part != "body")
+    message = first["msg"].removeprefix("Value error, ")
+    return error(400, f"{field}: {message}" if field else message)
+
+
+# ---------- Open routes ----------
+
+@app.post("/auth/signup", status_code=201, responses=BAD_REQUEST, tags=["auth"], summary="Create an account")
+def signup(body: Credentials):
+    try:
+        result = supabase_client().auth.sign_up({"email": body.email, "password": body.password})
+    except AuthApiError as exc:  # e.g. weak password, invalid email, rate limit
+        return error(400, exc.message)
+    user = result.user
+    return {
+        "user": {"id": user.id, "email": user.email, "created_at": user.created_at.isoformat()},
+        # Without a session, the project requires email confirmation before login.
+        "email_confirmation_required": result.session is None,
+    }
+
+
+@app.post(
+    "/auth/login",
+    responses={**BAD_REQUEST, 401: {"model": ErrorMessage, "description": "Wrong email or password"}},
+    tags=["auth"],
+    summary="Log in and receive a JWT",
+)
+def login(body: Credentials):
+    try:
+        result = supabase_client().auth.sign_in_with_password({"email": body.email, "password": body.password})
+    except AuthApiError:
+        # Same message whether the email exists or not: don't help attackers enumerate accounts.
+        return error(401, "Invalid login credentials")
+    session = result.session
+    return {
+        "access_token": session.access_token,
+        "refresh_token": session.refresh_token,
+        "token_type": "bearer",
+        "expires_in": session.expires_in,
+        "user": {"id": result.user.id, "email": result.user.email},
+    }
