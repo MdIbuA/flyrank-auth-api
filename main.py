@@ -8,14 +8,14 @@ import logging
 from contextlib import asynccontextmanager
 
 import httpx
-from fastapi import FastAPI, Header, Request
+from fastapi import Depends, FastAPI, Request, Response
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, StrictStr, field_validator
-from supabase_auth.errors import AuthApiError
+from supabase_auth.errors import AuthApiError, AuthError
 
 import config
-from auth import supabase_client
+from auth import AuthFailure, require_user, supabase_client
 
 log = logging.getLogger("uvicorn.error")
 
@@ -62,6 +62,7 @@ class ErrorMessage(BaseModel):
     error: str
 
 
+UNAUTHORIZED = {401: {"model": ErrorMessage, "description": "Missing, malformed, invalid or expired token"}}
 BAD_REQUEST = {400: {"model": ErrorMessage, "description": "Missing or invalid email/password"}}
 
 
@@ -69,6 +70,13 @@ BAD_REQUEST = {400: {"model": ErrorMessage, "description": "Missing or invalid e
 
 def error(status: int, message: str) -> JSONResponse:
     return JSONResponse(status_code=status, content={"error": message})
+
+
+@app.exception_handler(AuthFailure)
+async def auth_failure_handler(request: Request, exc: AuthFailure):
+    return JSONResponse(
+        status_code=401, content={"error": exc.message}, headers={"WWW-Authenticate": "Bearer"}
+    )
 
 
 @app.exception_handler(RequestValidationError)
@@ -122,21 +130,23 @@ def public_info():
     return {"message": "Welcome stranger! This info is public."}
 
 
-@app.get("/protected/profile", tags=["protected"], summary="Your account details")
-def profile(authorization: str | None = Header(None)):
-    scheme, _, token = (authorization or "").partition(" ")
-    if scheme.lower() != "bearer" or not token.strip():
-        return error(401, "Access token required")
+# ---------- Protected routes (every one goes through require_user) ----------
+
+@app.get("/protected/profile", responses=UNAUTHORIZED, tags=["protected"], summary="Your account details")
+def profile(user: dict = Depends(require_user)):
+    return {k: v for k, v in user.items() if k != "token"}
+
+
+@app.get("/protected/dashboard", responses=UNAUTHORIZED, tags=["protected"], summary="A second protected route")
+def dashboard(user: dict = Depends(require_user)):
+    return {"message": f"Welcome back, {user['email']}!", "user_id": user["id"]}
+
+
+@app.post("/auth/logout", status_code=204, responses=UNAUTHORIZED, tags=["auth"], summary="End this session")
+def logout(user: dict = Depends(require_user)):
     try:
-        response = supabase_client().auth.get_user(token.strip())
-    except AuthApiError:
-        response = None
-    if response is None or response.user is None:
-        return error(401, "Invalid or expired token")
-    user = response.user
-    return {
-        "id": user.id,
-        "email": user.email,
-        "created_at": user.created_at.isoformat() if user.created_at else None,
-        "last_sign_in_at": user.last_sign_in_at.isoformat() if user.last_sign_in_at else None,
-    }
+        # scope="local": end only the session this token belongs to, not the user's other devices.
+        supabase_client().auth.admin.sign_out(user["token"], scope="local")
+    except AuthError:
+        raise AuthFailure("Invalid or expired token")
+    return Response(status_code=204)
